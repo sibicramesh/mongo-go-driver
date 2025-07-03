@@ -494,13 +494,18 @@ var memoryPool = sync.Pool{
 
 // Execute runs this operation.
 func (op Operation) Execute(ctx context.Context) error {
+	execStart := time.Now()
+	fmt.Printf("Step 0: Execute start: %v\n", execStart)
+
 	err := op.Validate()
+	fmt.Printf("Step 1: Validate duration: %v\n", time.Since(execStart))
 	if err != nil {
 		return err
 	}
 
 	// If no deadline is set on the passed-in context, op.Timeout is set, and context is not already
 	// a Timeout context, honor op.Timeout in new Timeout context for operation execution.
+	ctxStart := time.Now()
 	if _, deadlineSet := ctx.Deadline(); !deadlineSet && op.Timeout != nil && !csot.IsTimeoutContext(ctx) {
 		newCtx, cancelFunc := csot.MakeTimeoutContext(ctx, *op.Timeout)
 		// Redefine ctx to be the new timeout-derived context.
@@ -508,13 +513,17 @@ func (op Operation) Execute(ctx context.Context) error {
 		// Cancel the timeout-derived context at the end of Execute to avoid a context leak.
 		defer cancelFunc()
 	}
+	fmt.Printf("Step 2: Context setup duration: %v\n", time.Since(ctxStart))
 
+	clientStart := time.Now()
 	if op.Client != nil {
 		if err := op.Client.StartCommand(); err != nil {
 			return err
 		}
 	}
+	fmt.Printf("Step 3: Client start command duration: %v\n", time.Since(clientStart))
 
+	retryStart := time.Now()
 	var retries int
 	if op.RetryMode != nil {
 		switch op.Type {
@@ -543,6 +552,7 @@ func (op Operation) Execute(ctx context.Context) error {
 	if csot.IsTimeoutContext(ctx) && retryEnabled {
 		retries = -1
 	}
+	fmt.Printf("Step 4: Retry setup duration: %v\n", time.Since(retryStart))
 
 	var srvr Server
 	var conn Connection
@@ -563,6 +573,7 @@ func (op Operation) Execute(ctx context.Context) error {
 	// resetForRetry records the error that caused the retry, decrements retries, and resets the
 	// retry loop variables to request a new server and a new connection for the next attempt.
 	resetForRetry := func(err error) {
+		resetStart := time.Now()
 		retries--
 		prevErr = err
 
@@ -600,8 +611,10 @@ func (op Operation) Execute(ctx context.Context) error {
 		// Set the server and connection to nil to request a new server and connection.
 		srvr = nil
 		conn = nil
+		fmt.Printf("Step 5: Reset for retry duration: %v\n", time.Since(resetStart))
 	}
 
+	wmStart := time.Now()
 	wm := memoryPool.Get().(*[]byte)
 	defer func() {
 		// Proper usage of a sync.Pool requires each entry to have approximately the same memory
@@ -616,17 +629,29 @@ func (op Operation) Execute(ctx context.Context) error {
 			memoryPool.Put(wm)
 		}
 	}()
+	fmt.Printf("Step 6: Wire message setup duration: %v\n", time.Since(wmStart))
+
+	loopCount := 0
 	for {
+		loopStart := time.Now()
+		fmt.Printf("Step 7.%d.0: Loop iteration %d start: %v\n", loopCount, loopCount, loopStart)
+		loopCount++
+
 		requestID := wiremessage.NextRequestID()
 
 		// If the server or connection are nil, try to select a new server and get a new connection.
+		connStart := time.Now()
 		if srvr == nil || conn == nil {
+			fmt.Printf("Step 7.%d.1: Getting new server and connection\n", loopCount-1)
 			srvr, conn, err = op.getServerAndConnection(ctx, requestID, deprioritizedServers)
+			fmt.Printf("Step 7.%d.2: Server and connection acquisition duration: %v\n", loopCount-1, time.Since(connStart))
+
 			if err != nil {
 				// If the returned error is retryable and there are retries remaining (negative
 				// retries means retry indefinitely), then retry the operation. Set the server
 				// and connection to nil to request a new server and connection.
 				if rerr, ok := err.(RetryablePoolError); ok && rerr.Retryable() && retries != 0 {
+					fmt.Printf("Step 7.%d.3: Retryable pool error, resetting for retry\n", loopCount-1)
 					resetForRetry(err)
 					continue
 				}
@@ -647,13 +672,18 @@ func (op Operation) Execute(ctx context.Context) error {
 				if op.Client.Terminated {
 					return fmt.Errorf("unexpected nil session for a terminated implicit session")
 				}
+				clientServerStart := time.Now()
 				if err := op.Client.SetServer(); err != nil {
 					return err
 				}
+				fmt.Printf("Step 7.%d.4: Client SetServer duration: %v\n", loopCount-1, time.Since(clientServerStart))
 			}
+		} else {
+			fmt.Printf("Step 7.%d.1: Using existing server and connection\n", loopCount-1)
 		}
 
 		// Run steps that must only be run on the first attempt, but not again for retries.
+		firstStart := time.Now()
 		if first {
 			// Determine if retries are supported for the current operation on the current server
 			// description. Per the retryable writes specification, only determine this for the
@@ -682,8 +712,10 @@ func (op Operation) Execute(ctx context.Context) error {
 
 			first = false
 		}
+		fmt.Printf("Step 7.%d.5: First attempt setup duration: %v\n", loopCount-1, time.Since(firstStart))
 
 		// Calculate maxTimeMS value to potentially be appended to the wire message.
+		maxTimeStart := time.Now()
 		maxTimeMS, err := op.calculateMaxTimeMS(ctx, srvr.RTTMonitor().P90(), srvr.RTTMonitor().Stats())
 		if err != nil {
 			return err
@@ -694,9 +726,13 @@ func (op Operation) Execute(ctx context.Context) error {
 		if conn.Description().IsCryptd {
 			maxTimeMS = 0
 		}
+		fmt.Printf("Step 7.%d.6: MaxTimeMS calculation duration: %v\n", loopCount-1, time.Since(maxTimeStart))
 
+		descStart := time.Now()
 		desc := description.SelectedServer{Server: conn.Description(), Kind: op.Deployment.Kind()}
+		fmt.Printf("Step 7.%d.7: Description setup duration: %v\n", loopCount-1, time.Since(descStart))
 
+		batchStart := time.Now()
 		if batching {
 			targetBatchSize := desc.MaxDocumentSize
 			maxDocSize := desc.MaxDocumentSize
@@ -714,15 +750,19 @@ func (op Operation) Execute(ctx context.Context) error {
 				return err
 			}
 		}
+		fmt.Printf("Step 7.%d.8: Batch setup duration: %v\n", loopCount-1, time.Since(batchStart))
 
+		wireMessageStart := time.Now()
 		var startedInfo startedInformation
 		*wm, startedInfo, err = op.createWireMessage(ctx, maxTimeMS, (*wm)[:0], desc, conn, requestID)
+		fmt.Printf("Step 7.%d.9: Wire message creation duration: %v\n", loopCount-1, time.Since(wireMessageStart))
 
 		if err != nil {
 			return err
 		}
 
 		// set extra data and send event if possible
+		eventStart := time.Now()
 		startedInfo.connID = conn.ID()
 		startedInfo.driverConnectionID = conn.DriverConnectionID()
 		startedInfo.cmdName = op.getCommandName(startedInfo.cmd)
@@ -741,11 +781,13 @@ func (op Operation) Execute(ctx context.Context) error {
 		startedInfo.serverAddress = conn.Description().Addr
 
 		op.publishStartedEvent(ctx, startedInfo)
+		fmt.Printf("Step 7.%d.10: Event publishing duration: %v\n", loopCount-1, time.Since(eventStart))
 
 		// get the moreToCome flag information before we compress
 		moreToCome := wiremessage.IsMsgMoreToCome(*wm)
 
 		// compress wiremessage if allowed
+		compressStart := time.Now()
 		if compressor, ok := conn.(Compressor); ok && op.canCompress(startedInfo.cmdName) {
 			b := memoryPool.Get().(*[]byte)
 			*b, err = compressor.CompressWireMessage(*wm, (*b)[:0])
@@ -755,6 +797,7 @@ func (op Operation) Execute(ctx context.Context) error {
 				return err
 			}
 		}
+		fmt.Printf("Step 7.%d.11: Compression duration: %v\n", loopCount-1, time.Since(compressStart))
 
 		finishedInfo := finishedInformation{
 			cmdName:            startedInfo.cmdName,
@@ -772,6 +815,7 @@ func (op Operation) Execute(ctx context.Context) error {
 		// Check for possible context error. If no context error, check if there's enough time to perform a
 		// round trip before the Context deadline. If ctx is a Timeout Context, use the 90th percentile RTT
 		// as a threshold. Otherwise, use the minimum observed RTT.
+		ctxCheckStart := time.Now()
 		if ctx.Err() != nil {
 			err = ctx.Err()
 		} else if deadline, ok := ctx.Deadline(); ok {
@@ -785,6 +829,7 @@ func (op Operation) Execute(ctx context.Context) error {
 				err = context.DeadlineExceeded
 			}
 		}
+		fmt.Printf("Step 7.%d.12: Context check duration: %v\n", loopCount-1, time.Since(ctxCheckStart))
 
 		if err == nil {
 			// roundtrip using either the full roundTripper or a special one for when the moreToCome
@@ -793,7 +838,11 @@ func (op Operation) Execute(ctx context.Context) error {
 			if moreToCome {
 				roundTrip = op.moreToComeRoundTrip
 			}
+
+			roundTripStart := time.Now()
+			fmt.Printf("Step 7.%d.13: Starting roundTrip at: %v\n", loopCount-1, roundTripStart)
 			res, err = roundTrip(ctx, conn, *wm)
+			fmt.Printf("Step 7.%d.14: Round trip duration: %v\n", loopCount-1, time.Since(roundTripStart))
 
 			if ep, ok := srvr.(ErrorProcessor); ok {
 				_ = ep.ProcessError(err, conn)
@@ -804,12 +853,15 @@ func (op Operation) Execute(ctx context.Context) error {
 		finishedInfo.cmdErr = err
 		finishedInfo.duration = time.Since(startedTime)
 
+		finishEventStart := time.Now()
 		op.publishFinishedEvent(ctx, finishedInfo)
+		fmt.Printf("Step 7.%d.15: Finish event publishing duration: %v\n", loopCount-1, time.Since(finishEventStart))
 
 		// prevIndefiniteErrorIsSet is "true" if the "err" variable has been set to the "prevIndefiniteErr" in
 		// a case in the switch statement below.
 		var prevIndefiniteErrIsSet bool
 
+		errorHandlingStart := time.Now()
 		// TODO(GODRIVER-2579): When refactoring the "Execute" method, consider creating a separate method for the
 		// error handling logic below. This will remove the necessity of the "checkError" goto label.
 	checkError:
@@ -998,10 +1050,12 @@ func (op Operation) Execute(ctx context.Context) error {
 			}
 			return err
 		}
+		fmt.Printf("Step 7.%d.16: Error handling duration: %v\n", loopCount-1, time.Since(errorHandlingStart))
 
 		// If we're batching and there are batches remaining, advance to the next batch. This isn't
 		// a retry, so increment the transaction number, reset the retries number, and don't set
 		// server or connection to nil to continue using the same connection.
+		batchCheckStart := time.Now()
 		if batching && len(op.Batches.Documents) > 0 {
 			// If retries are supported for the current operation on the current server description,
 			// the session isn't nil, and client retries are enabled, increment the txn number.
@@ -1019,13 +1073,20 @@ func (op Operation) Execute(ctx context.Context) error {
 			}
 			currIndex += len(op.Batches.Current)
 			op.Batches.ClearBatch()
+			fmt.Printf("Step 7.%d.17: Continuing to next batch\n", loopCount-1)
 			continue
 		}
+		fmt.Printf("Step 7.%d.17: Batch check duration: %v\n", loopCount-1, time.Since(batchCheckStart))
+
+		fmt.Printf("Step 7.%d.18: Total loop iteration %d duration: %v\n", loopCount-1, loopCount-1, time.Since(loopStart))
 		break
 	}
+
 	if len(operationErr.WriteErrors) > 0 || operationErr.WriteConcernError != nil {
 		return operationErr
 	}
+
+	fmt.Printf("Step 8: Total Execute duration: %v\n", time.Since(execStart))
 	return nil
 }
 

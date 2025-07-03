@@ -798,24 +798,15 @@ func (coll *Collection) Aggregate(ctx context.Context, pipeline interface{},
 
 // aggregate is the helper method for Aggregate
 func aggregate(a aggregateParams) (cur *Cursor, err error) {
-	start := time.Now()
-
 	if a.ctx == nil {
 		a.ctx = context.Background()
 	}
 
-	// Step 1: Marshal pipeline
-	step1Start := time.Now()
 	pipelineArr, hasOutputStage, err := marshalAggregatePipeline(a.pipeline, a.bsonOpts, a.registry)
-	step1Duration := time.Since(step1Start)
-	fmt.Printf("Step 1 - Marshal pipeline: %v\n", step1Duration)
-
 	if err != nil {
 		return nil, err
 	}
 
-	// Step 2: Session setup
-	step2Start := time.Now()
 	sess := sessionFromContext(a.ctx)
 	// Always close any created implicit sessions if aggregate returns an error.
 	defer func() {
@@ -829,11 +820,7 @@ func aggregate(a aggregateParams) (cur *Cursor, err error) {
 	if err = a.client.validSession(sess); err != nil {
 		return nil, err
 	}
-	step2Duration := time.Since(step2Start)
-	fmt.Printf("Step 2 - Session setup: %v\n", step2Duration)
 
-	// Step 3: Configure write/read concerns
-	step3Start := time.Now()
 	var wc *writeconcern.WriteConcern
 	if hasOutputStage {
 		wc = a.writeConcern
@@ -847,24 +834,18 @@ func aggregate(a aggregateParams) (cur *Cursor, err error) {
 		closeImplicitSession(sess)
 		sess = nil
 	}
-	step3Duration := time.Since(step3Start)
-	fmt.Printf("Step 3 - Configure write/read concerns: %v\n", step3Duration)
 
-	// Step 4: Setup selector and options
-	step4Start := time.Now()
 	selector := makeReadPrefSelector(sess, a.readSelector, a.client.localThreshold)
 	if hasOutputStage {
 		selector = makeOutputAggregateSelector(sess, a.readPreference, a.client.localThreshold)
 	}
 
 	ao := options.MergeAggregateOptions(a.opts...)
-	cursorOpts := a.client.createBaseCursorOptions()
-	cursorOpts.MarshalValueEncoderFn = newEncoderFn(a.bsonOpts, a.registry)
-	step4Duration := time.Since(step4Start)
-	fmt.Printf("Step 4 - Setup selector and options: %v\n", step4Duration)
 
-	// Step 5: Create operation
-	step5Start := time.Now()
+	cursorOpts := a.client.createBaseCursorOptions()
+
+	cursorOpts.MarshalValueEncoderFn = newEncoderFn(a.bsonOpts, a.registry)
+
 	op := operation.NewAggregate(pipelineArr).
 		Session(sess).
 		WriteConcern(wc).
@@ -881,11 +862,7 @@ func aggregate(a aggregateParams) (cur *Cursor, err error) {
 		HasOutputStage(hasOutputStage).
 		Timeout(a.client.timeout).
 		MaxTime(ao.MaxTime)
-	step5Duration := time.Since(step5Start)
-	fmt.Printf("Step 5 - Create operation: %v\n", step5Duration)
 
-	// Step 6: Configure operation options
-	step6Start := time.Now()
 	if ao.AllowDiskUse != nil {
 		op.AllowDiskUse(*ao.AllowDiskUse)
 	}
@@ -943,25 +920,14 @@ func aggregate(a aggregateParams) (cur *Cursor, err error) {
 		}
 		op.CustomOptions(customOptions)
 	}
-	step6Duration := time.Since(step6Start)
-	fmt.Printf("Step 6 - Configure operation options: %v\n", step6Duration)
 
-	// Step 7: Configure retry
-	step7Start := time.Now()
 	retry := driver.RetryNone
 	if a.retryRead && !hasOutputStage {
 		retry = driver.RetryOncePerCommand
 	}
 	op = op.Retry(retry)
-	step7Duration := time.Since(step7Start)
-	fmt.Printf("Step 7 - Configure retry: %v\n", step7Duration)
 
-	// Step 8: Execute operation
-	step8Start := time.Now()
 	err = op.Execute(a.ctx)
-	step8Duration := time.Since(step8Start)
-	fmt.Printf("Step 8 - Execute operation: %v\n", step8Duration)
-
 	if err != nil {
 		if wce, ok := err.(driver.WriteCommandError); ok && wce.WriteConcernError != nil {
 			return nil, *convertDriverWriteConcernError(wce.WriteConcernError)
@@ -969,19 +935,11 @@ func aggregate(a aggregateParams) (cur *Cursor, err error) {
 		return nil, replaceErrors(err)
 	}
 
-	// Step 9: Process results
-	step9Start := time.Now()
 	bc, err := op.Result(cursorOpts)
 	if err != nil {
 		return nil, replaceErrors(err)
 	}
 	cursor, err := newCursorWithSession(bc, a.client.bsonOpts, a.registry, sess)
-	step9Duration := time.Since(step9Start)
-	fmt.Printf("Step 9 - Process results: %v\n", step9Duration)
-
-	totalDuration := time.Since(start)
-	fmt.Printf("Total aggregate function duration: %v\n", totalDuration)
-
 	return cursor, replaceErrors(err)
 }
 
